@@ -1,10 +1,11 @@
 """
-Captação de leads B2B via Apify — LinkedIn People/Company Search.
+Captação de leads B2B via Apify — harvestapi/linkedin-profile-search.
 
-Actor usado: "apify/linkedin-profile-scraper" ou equivalente gratuito.
-Filtra por cargo (dono/sócio/diretor) e setor (móveis planejados / marcenaria).
+Actor: harvestapi/linkedin-profile-search
+Input: currentJobTitles, keywords, geoUrns (localização), takePages
+Output: perfis com nome, cargo, empresa, localização, linkedin_url
 
-Referência: https://docs.apify.com/api/client/python
+Referência: https://github.com/HarvestAPI/apify-linkedin-profile-search
 """
 
 from __future__ import annotations
@@ -20,11 +21,9 @@ from captacao.models import FonteLead, LeadRaw
 
 logger = logging.getLogger(__name__)
 
-# Actor público gratuito para busca de pessoas no LinkedIn
-# Alternativa: "anchor/linkedin-profile-scraper" (free tier)
-ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "apify/linkedin-profile-scraper")
+ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "harvestapi/linkedin-profile-search")
 
-# Cargos-alvo: donos e decisores de lojas e marcenarias
+# Cargos-alvo: decisores de lojas e marcenarias
 CARGOS_ALVO = [
     "dono",
     "proprietário",
@@ -33,16 +32,32 @@ CARGOS_ALVO = [
     "CEO",
     "fundador",
     "gerente geral",
+    "owner",
+    "founder",
 ]
 
 # Keywords de busca para o nicho
 KEYWORDS_NICHO = [
     "loja móveis planejados",
-    "móveis planejados",
     "marcenaria",
-    "marcenaria sob medida",
     "móveis sob medida",
+    "marcenaria sob medida",
 ]
+
+# Mapeamento de estados BR para GeoURN do LinkedIn
+# IDs obtidos via LinkedIn API — os mais relevantes para BR
+GEO_URNS_BR: dict[str, str] = {
+    "São Paulo": "106057199",
+    "Rio de Janeiro": "104769234",
+    "Minas Gerais": "102278238",
+    "Paraná": "102081502",
+    "Santa Catarina": "102681177",
+    "Rio Grande do Sul": "101620748",
+    "Bahia": "106765561",
+    "Goiás": "106765748",
+    "Espírito Santo": "104375742",
+    "Pernambuco": "106573891",
+}
 
 
 def _normalizar_telefone(raw: Optional[str]) -> Optional[str]:
@@ -61,34 +76,38 @@ def _extrair_estado(location: Optional[str]) -> Optional[str]:
     """Tenta extrair UF a partir do campo location do LinkedIn."""
     if not location:
         return None
-    # Formato comum: "São Paulo, Brasil" ou "Curitiba, Paraná, Brasil"
     partes = [p.strip() for p in location.split(",")]
     if len(partes) >= 2:
-        return partes[-2]  # penúltimo = estado geralmente
+        return partes[-2]
     return None
 
 
 def _item_para_lead_raw(item: dict) -> Optional[LeadRaw]:
-    """Converte um item do dataset Apify em LeadRaw. Retorna None se inválido."""
-    nome = item.get("fullName") or item.get("name") or item.get("firstName", "")
-    if not nome:
+    """Converte um item do dataset Apify em LeadRaw."""
+    nome = (
+        item.get("fullName")
+        or item.get("name")
+        or f"{item.get('firstName', '')} {item.get('lastName', '')}".strip()
+    )
+    if not nome or nome.strip() == "":
         logger.debug("Item sem nome, ignorando: %s", item.get("linkedinUrl"))
         return None
 
     empresa = (
         item.get("companyName")
         or item.get("currentCompany")
-        or (item.get("positions") or [{}])[0].get("companyName")
+        or (((item.get("positions") or [{}])[0]).get("companyName"))
         or ""
     )
 
     cargo = (
         item.get("headline")
         or item.get("currentPosition")
-        or (item.get("positions") or [{}])[0].get("title")
+        or item.get("title")
+        or (((item.get("positions") or [{}])[0]).get("title"))
     )
 
-    location = item.get("location") or item.get("city") or ""
+    location = item.get("location") or item.get("geoLocationName") or ""
     cidade_raw = location.split(",")[0].strip() if location else None
 
     return LeadRaw(
@@ -98,7 +117,7 @@ def _item_para_lead_raw(item: dict) -> Optional[LeadRaw]:
         cidade=cidade_raw,
         estado=_extrair_estado(location),
         telefone=_normalizar_telefone(item.get("phone")),
-        linkedin_url=item.get("linkedinUrl") or item.get("url"),
+        linkedin_url=item.get("linkedinUrl") or item.get("profileUrl") or item.get("url"),
         site_url=item.get("companyWebsite") or item.get("website"),
         fonte=FonteLead.LINKEDIN_APIFY,
         apify_raw=item,
@@ -108,7 +127,7 @@ def _item_para_lead_raw(item: dict) -> Optional[LeadRaw]:
 def _filtrar_cargo(lead: LeadRaw) -> bool:
     """Retorna True se o cargo do lead é um decisor-alvo."""
     if not lead.cargo:
-        return True  # sem cargo, mantém para não perder leads
+        return True
     cargo_lower = lead.cargo.lower()
     return any(c.lower() in cargo_lower for c in CARGOS_ALVO)
 
@@ -120,12 +139,12 @@ def _filtrar_cargo(lead: LeadRaw) -> bool:
 )
 def _run_actor(client: ApifyClient, run_input: dict) -> list[dict]:
     """Executa o actor Apify e retorna os itens do dataset."""
-    logger.info("Iniciando actor %s com input: %s", ACTOR_ID, run_input)
+    logger.info("Iniciando actor %s", ACTOR_ID)
     run = client.actor(ACTOR_ID).call(run_input=run_input)
 
     if run is None or run.get("status") != "SUCCEEDED":
         status = run.get("status") if run else "None"
-        raise RuntimeError(f"Actor finalizou com status inesperado: {status}")
+        raise RuntimeError(f"Actor finalizou com status: {status}")
 
     items = client.dataset(run["defaultDatasetId"]).list_items().items
     logger.info("Actor retornou %d itens", len(items))
@@ -142,26 +161,30 @@ def capturar_leads(
     Executa o scraper do LinkedIn via Apify e retorna lista de LeadRaw.
 
     Args:
-        keyword:      Termo de busca (ex: "loja móveis planejados")
-        estado:       Filtro geográfico opcional (ex: "São Paulo")
-        max_results:  Limite de resultados
-        apify_token:  Token da API Apify (fallback: var APIFY_TOKEN)
-
-    Returns:
-        Lista de LeadRaw filtrados por cargo-alvo
+        keyword:      Keyword de busca geral (ex: "móveis planejados")
+        estado:       Estado BR para filtro de localização
+        max_results:  Limite de resultados (1 página = 25 perfis)
+        apify_token:  Token Apify (fallback: APIFY_TOKEN)
     """
     token = apify_token or os.environ["APIFY_TOKEN"]
     client = ApifyClient(token)
 
-    search_query = keyword
-    if estado:
-        search_query = f"{keyword} {estado}"
-
-    run_input = {
-        "searchUrl": f"https://www.linkedin.com/search/results/people/?keywords={search_query}",
-        "maxResults": max_results,
-        "proxyConfiguration": {"useApifyProxy": True},
+    # Monta o run_input conforme schema do harvestapi/linkedin-profile-search
+    run_input: dict = {
+        "keywords": keyword,
+        "currentJobTitles": CARGOS_ALVO[:5],  # filtra por cargos diretamente
+        "takePages": max(1, max_results // 25),
+        "scrapeType": "short",  # short = só dados básicos, mais barato ($0.10/página)
     }
+
+    # Adiciona filtro de localização via geoUrn se disponível
+    if estado and estado in GEO_URNS_BR:
+        run_input["geoUrns"] = [GEO_URNS_BR[estado]]
+        logger.info("Filtro de localização: %s (geoUrn: %s)", estado, GEO_URNS_BR[estado])
+    elif estado:
+        # Estado não mapeado — usa keyword combinada
+        run_input["keywords"] = f"{keyword} {estado}"
+        logger.warning("Estado '%s' sem geoUrn mapeado — usando keyword combinada", estado)
 
     raw_items = _run_actor(client, run_input)
 
@@ -172,7 +195,7 @@ def capturar_leads(
             leads.append(lead)
 
     logger.info(
-        "Captação concluída: %d/%d leads após filtro de cargo",
+        "Captação: %d/%d leads após filtro de cargo",
         len(leads),
         len(raw_items),
     )
@@ -188,17 +211,8 @@ def capturar_batch(
     """
     Executa captação para múltiplas combinações keyword × estado.
     Deduplica por linkedin_url.
-
-    Args:
-        estados:               Lista de UFs alvo (ex: ["São Paulo", "Paraná"])
-        keywords:              Lista de keywords (default: KEYWORDS_NICHO)
-        max_por_combinacao:    Limite por combinação
-        apify_token:           Token Apify
-
-    Returns:
-        Lista deduplicada de LeadRaw
     """
-    kws = keywords or KEYWORDS_NICHO[:2]  # padrão: 2 keywords para economizar cota
+    kws = keywords or KEYWORDS_NICHO[:2]
     vistos: set[str] = set()
     todos: list[LeadRaw] = []
 
