@@ -1,17 +1,17 @@
 """
-Captação de leads B2B via Apify — harvestapi/linkedin-profile-search.
+Captação de leads B2B por múltiplos provedores.
 
-Actor: harvestapi/linkedin-profile-search
-Input: currentJobTitles, keywords, geoUrns (localização), takePages
-Output: perfis com nome, cargo, empresa, localização, linkedin_url
-
-Referência: https://github.com/HarvestAPI/apify-linkedin-profile-search
+Provedores suportados:
+- ddgs (padrão): busca gratuita via DuckDuckGo Search
+- apify: actor harvestapi/linkedin-profile-search
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+from urllib.parse import urlparse
 from typing import Optional
 
 from apify_client import ApifyClient
@@ -22,6 +22,7 @@ from captacao.models import FonteLead, LeadRaw
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "harvestapi/linkedin-profile-search")
+PROVIDER = os.getenv("CAPTACAO_PROVIDER", "ddgs").lower()
 
 # Cargos-alvo: decisores de lojas e marcenarias
 CARGOS_ALVO = [
@@ -58,6 +59,36 @@ GEO_URNS_BR: dict[str, str] = {
     "Espírito Santo": "104375742",
     "Pernambuco": "106573891",
 }
+
+
+def _normalizar_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        if not parsed.netloc:
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        return None
+
+
+def _empresa_from_text(texto: str, fallback_url: Optional[str]) -> str:
+    if texto:
+        limpo = re.sub(r"\s+", " ", texto).strip()
+        for sep in ("|", "-", "—"):
+            if sep in limpo:
+                candidato = limpo.split(sep, 1)[0].strip()
+                if len(candidato) >= 3:
+                    return candidato
+        if len(limpo) >= 3:
+            return limpo[:120]
+    if fallback_url:
+        netloc = urlparse(fallback_url).netloc
+        return netloc.replace("www.", "")
+    return "Empresa não identificada"
 
 
 def _normalizar_telefone(raw: Optional[str]) -> Optional[str]:
@@ -134,6 +165,34 @@ def _item_para_lead_raw(item: dict) -> Optional[LeadRaw]:
     )
 
 
+def _resultado_web_para_lead_raw(item: dict, estado: Optional[str]) -> Optional[LeadRaw]:
+    """Converte resultado de web search em LeadRaw para enriquecimento posterior."""
+    url = _normalizar_url(item.get("href") or item.get("url") or "")
+    if not url:
+        return None
+
+    titulo = item.get("title") or ""
+    descricao = item.get("body") or item.get("snippet") or ""
+    empresa = _empresa_from_text(titulo, url)
+    nome = "Contato Comercial"
+
+    telefone_match = re.search(r"(?:\+?55)?\s?\(?\d{2}\)?\s?9?\d{4}-?\d{4}", descricao)
+    telefone = _normalizar_telefone(telefone_match.group(0)) if telefone_match else None
+
+    return LeadRaw(
+        nome=nome,
+        empresa=empresa,
+        cargo=None,
+        cidade=None,
+        estado=estado,
+        telefone=telefone,
+        linkedin_url=None,
+        site_url=url,
+        fonte=FonteLead.LINKEDIN_APIFY,
+        apify_raw=item,
+    )
+
+
 def _filtrar_cargo(lead: LeadRaw) -> bool:
     """Retorna True se o cargo do lead é um decisor-alvo."""
     if not lead.cargo:
@@ -161,33 +220,59 @@ def _run_actor(client: ApifyClient, run_input: dict) -> list[dict]:
     return items
 
 
-def capturar_leads(
+def _capturar_leads_ddgs(
+    keyword: str,
+    estado: Optional[str] = None,
+    max_results: int = 100,
+) -> list[LeadRaw]:
+    """Busca leads por pesquisa web gratuita (DuckDuckGo)."""
+    try:
+        from duckduckgo_search import DDGS
+    except Exception as exc:
+        raise RuntimeError(
+            "Dependência 'duckduckgo-search' não instalada. "
+            "Adicione no ambiente para usar CAPTACAO_PROVIDER=ddgs."
+        ) from exc
+
+    query_parts = [keyword]
+    if estado:
+        query_parts.append(f'"{estado}"')
+    query_parts.extend(["site:.br", "(móveis OR marcenaria OR planejados)"])
+    query = " ".join(query_parts)
+
+    logger.info("Buscando DDGS: %s", query)
+    resultados: list[dict] = []
+    with DDGS() as ddgs:
+        for item in ddgs.text(query, region="br-pt", safesearch="off", max_results=max_results):
+            resultados.append(item)
+
+    leads: list[LeadRaw] = []
+    for item in resultados:
+        lead = _resultado_web_para_lead_raw(item, estado)
+        if lead:
+            leads.append(lead)
+
+    logger.info("DDGS retornou %d leads brutos", len(leads))
+    return leads
+
+
+def _capturar_leads_apify(
     keyword: str,
     estado: Optional[str] = None,
     max_results: int = 100,
     apify_token: Optional[str] = None,
 ) -> list[LeadRaw]:
-    """
-    Executa o scraper do LinkedIn via Apify e retorna lista de LeadRaw.
-
-    Args:
-        keyword:      Keyword de busca geral (ex: "móveis planejados")
-        estado:       Estado BR para filtro de localização
-        max_results:  Limite de resultados (1 página = 25 perfis)
-        apify_token:  Token Apify (fallback: APIFY_TOKEN)
-    """
+    """Executa o scraper do LinkedIn via Apify e retorna lista de LeadRaw."""
     token = apify_token or os.environ["APIFY_TOKEN"]
     client = ApifyClient(token)
 
-    # Monta o run_input conforme schema do harvestapi/linkedin-profile-search
     run_input: dict = {
-        "query": keyword,                       # campo correto: general fuzzy search
-        "currentJobTitles": CARGOS_ALVO[:5],   # filtra por cargos diretamente
+        "query": keyword,
+        "currentJobTitles": CARGOS_ALVO[:5],
         "takePages": max(1, max_results // 25),
-        "scrapeType": "short",                 # $0.10/página, só dados básicos
+        "scrapeType": "short",
     }
 
-    # Adiciona filtro de localização — campo correto: locations (texto)
     if estado:
         run_input["locations"] = [estado]
         logger.info("Filtro de localização: %s", estado)
@@ -201,11 +286,40 @@ def capturar_leads(
             leads.append(lead)
 
     logger.info(
-        "Captação: %d/%d leads após filtro de cargo",
+        "Captação Apify: %d/%d leads após filtro de cargo",
         len(leads),
         len(raw_items),
     )
     return leads
+
+
+def capturar_leads(
+    keyword: str,
+    estado: Optional[str] = None,
+    max_results: int = 100,
+    apify_token: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> list[LeadRaw]:
+    """
+    Executa o scraper do LinkedIn via Apify e retorna lista de LeadRaw.
+
+    Args:
+        keyword:      Keyword de busca geral (ex: "móveis planejados")
+        estado:       Estado BR para filtro de localização
+        max_results:  Limite de resultados (1 página = 25 perfis)
+        apify_token:  Token Apify (fallback: APIFY_TOKEN)
+    """
+    prov = (provider or PROVIDER).lower()
+    if prov == "ddgs":
+        return _capturar_leads_ddgs(keyword=keyword, estado=estado, max_results=max_results)
+    if prov == "apify":
+        return _capturar_leads_apify(
+            keyword=keyword,
+            estado=estado,
+            max_results=max_results,
+            apify_token=apify_token,
+        )
+    raise ValueError(f"CAPTACAO_PROVIDER inválido: {prov}. Use 'ddgs' ou 'apify'.")
 
 
 def capturar_batch(
@@ -213,6 +327,7 @@ def capturar_batch(
     keywords: Optional[list[str]] = None,
     max_por_combinacao: int = 50,
     apify_token: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> list[LeadRaw]:
     """
     Executa captação para múltiplas combinações keyword × estado.
@@ -231,9 +346,10 @@ def capturar_batch(
                     estado=estado,
                     max_results=max_por_combinacao,
                     apify_token=apify_token,
+                    provider=provider,
                 )
                 for lead in lote:
-                    chave = lead.linkedin_url or f"{lead.nome}|{lead.empresa}"
+                    chave = lead.site_url or lead.linkedin_url or f"{lead.nome}|{lead.empresa}"
                     if chave not in vistos:
                         vistos.add(chave)
                         todos.append(lead)
