@@ -1,0 +1,60 @@
+version: "3.8"
+
+# Stack de captação de leads B2B
+# Deploy: set -a && source .env && set +a && docker stack deploy -c docker-stack.captacao.yml captacao
+
+services:
+  captacao:
+    image: ghcr.io/jaumzerah/captacao-leads:${IMAGE_TAG:-latest}
+    networks:
+      - simplifiquenet
+    environment:
+      # Anthropic
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+      # Apify
+      - APIFY_TOKEN=${APIFY_TOKEN}
+      - APIFY_ACTOR_ID=${APIFY_ACTOR_ID:-apify/linkedin-profile-scraper}
+
+      # Firecrawl self-hosted (serviço na mesma rede overlay)
+      - FIRECRAWL_URL=${FIRECRAWL_URL:-http://firecrawl_firecrawl:3002}
+      - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-self-hosted}
+
+      # RabbitMQ (mesmo broker do SDR)
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq_rabbitmq:5672/${RABBITMQ_VHOST:-padrao}
+
+      # Agência
+      - OWNER_NAME=${OWNER_NAME:-João Andrade}
+      - BRAND_NAME=${BRAND_NAME:-Agência Simplifique}
+
+      # Configuração do batch
+      - CAPTACAO_ESTADOS=${CAPTACAO_ESTADOS:-São Paulo,Paraná,Santa Catarina}
+      - CAPTACAO_MAX_POR_COMBO=${CAPTACAO_MAX_POR_COMBO:-50}
+      - CAPTACAO_CAMPANHA=${CAPTACAO_CAMPANHA:-}
+
+      # LangSmith (opcional — para rastrear calls do LLM)
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY:-}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-captacao-leads}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-false}
+
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 30s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    # O container executa o batch e para — não é um serviço de longa duração.
+    # Para rodar diariamente use um cron externo ou um serviço de scheduler.
+    # Exemplo de cron no host (fora do Swarm):
+    #   0 8 * * * docker service update --force captacao_captacao
+
+networks:
+  simplifiquenet:
+    external: true
+    name: simplifiquenet

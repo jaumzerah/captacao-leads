@@ -1,0 +1,38 @@
+version: "3.8"
+
+# Firecrawl self-hosted — serviço separado no Swarm
+# Deploy: set -a && source .env && set +a && docker stack deploy -c docker-stack.firecrawl.yml firecrawl
+#
+# Repo oficial: https://github.com/mendableai/firecrawl
+# Imagem: ghcr.io/mendableai/firecrawl
+
+services:
+  firecrawl:
+    image: ghcr.io/mendableai/firecrawl:latest
+    networks:
+      - simplifiquenet
+    environment:
+      - PORT=3002
+      - HOST=0.0.0.0
+      # Sem chave externa — self-hosted não valida API key por padrão
+      # Para habilitar autenticação, defina USE_DB_AUTHENTICATION=true
+      - USE_DB_AUTHENTICATION=false
+      # Redis para cache de jobs
+      - REDIS_URL=redis://redis_redis:6379
+      # Playwright para páginas JS-heavy (opcional)
+      - PLAYWRIGHT_MICROSERVICE_URL=${PLAYWRIGHT_URL:-}
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+networks:
+  simplifiquenet:
+    external: true
+    name: simplifiquenet
