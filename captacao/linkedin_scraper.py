@@ -107,8 +107,18 @@ def _item_para_lead_raw(item: dict) -> Optional[LeadRaw]:
         or (((item.get("positions") or [{}])[0]).get("title"))
     )
 
-    location = item.get("location") or item.get("geoLocationName") or ""
-    cidade_raw = location.split(",")[0].strip() if location else None
+    # O actor pode retornar location como dict {"city": ..., "state": ...} ou string
+    location_raw = item.get("location") or item.get("geoLocationName") or ""
+    if isinstance(location_raw, dict):
+        cidade_raw = location_raw.get("city") or location_raw.get("name") or ""
+        location = ", ".join(filter(None, [
+            location_raw.get("city"),
+            location_raw.get("state"),
+            location_raw.get("country"),
+        ]))
+    else:
+        location = location_raw
+        cidade_raw = location.split(",")[0].strip() if location else None
 
     return LeadRaw(
         nome=nome.strip(),
