@@ -171,20 +171,16 @@ def capturar_leads(
 
     # Monta o run_input conforme schema do harvestapi/linkedin-profile-search
     run_input: dict = {
-        "keywords": keyword,
-        "currentJobTitles": CARGOS_ALVO[:5],  # filtra por cargos diretamente
+        "query": keyword,                       # campo correto: general fuzzy search
+        "currentJobTitles": CARGOS_ALVO[:5],   # filtra por cargos diretamente
         "takePages": max(1, max_results // 25),
-        "scrapeType": "short",  # short = só dados básicos, mais barato ($0.10/página)
+        "scrapeType": "short",                 # $0.10/página, só dados básicos
     }
 
-    # Adiciona filtro de localização via geoUrn se disponível
-    if estado and estado in GEO_URNS_BR:
-        run_input["geoUrns"] = [GEO_URNS_BR[estado]]
-        logger.info("Filtro de localização: %s (geoUrn: %s)", estado, GEO_URNS_BR[estado])
-    elif estado:
-        # Estado não mapeado — usa keyword combinada
-        run_input["keywords"] = f"{keyword} {estado}"
-        logger.warning("Estado '%s' sem geoUrn mapeado — usando keyword combinada", estado)
+    # Adiciona filtro de localização — campo correto: locations (texto)
+    if estado:
+        run_input["locations"] = [estado]
+        logger.info("Filtro de localização: %s", estado)
 
     raw_items = _run_actor(client, run_input)
 
